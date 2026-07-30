@@ -37,7 +37,7 @@ import {
   stopBrowserRecording,
 } from "~/browser/browserRecording";
 import { resolveBrowserRecordingStopTarget } from "~/browser/browserRecordingScope";
-import { useBrowserSurfaceStore } from "~/browser/browserSurfaceStore";
+import { useBrowserSurfaceStore, withBrowserCaptureSurface } from "~/browser/browserSurfaceStore";
 import { runBrowserViewportMutation } from "~/browser/browserViewportActions";
 import { previewRuntimeTabId } from "~/browser/previewRuntimeTabId";
 import { isElectron } from "~/env";
@@ -70,6 +70,7 @@ import {
   resolvePreviewAutomationOpenTab,
   resolvePreviewAutomationTarget,
 } from "./previewAutomationTarget";
+import { resolveHostWaitBudgetMs } from "./previewAutomationHostBudget";
 import { isPreviewViewportReady } from "./previewViewportReadiness";
 import { shouldRollbackPreviewViewport } from "./previewViewportRollback";
 
@@ -91,7 +92,10 @@ const waitForDesktopOverlay = async (
   operation: PreviewAutomationRequest["operation"],
   timeoutMs: number,
 ): Promise<void> => {
-  const deadline = Date.now() + timeoutMs;
+  // Expire before the broker does, so an unavailable overlay surfaces as
+  // PreviewAutomationOverlayTimeoutError rather than a bare broker timeout.
+  const waitBudgetMs = resolveHostWaitBudgetMs(timeoutMs);
+  const deadline = Date.now() + waitBudgetMs;
   while (Date.now() <= deadline) {
     const state = assertPreviewRuntimeCurrent(threadRef, tabId, runtimeTabId, {
       operation,
@@ -107,7 +111,7 @@ const waitForDesktopOverlay = async (
     requestId,
     environmentId: threadRef.environmentId,
     threadId: threadRef.threadId,
-    timeoutMs,
+    timeoutMs: waitBudgetMs,
   });
 };
 
@@ -577,7 +581,9 @@ function PreviewAutomationHost(props: { readonly environmentId: EnvironmentId })
           }
           case "snapshot": {
             const ready = await requireReadyTab();
-            return await ready.bridge.automation.snapshot(ready.runtimeTabId);
+            return await withBrowserCaptureSurface(ready.runtimeTabId, () =>
+              ready.bridge.automation.snapshot(ready.runtimeTabId),
+            );
           }
           case "click": {
             const ready = await requireReadyTab();

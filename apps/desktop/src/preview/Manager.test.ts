@@ -749,10 +749,16 @@ describe("PreviewManager", () => {
           /\/browser-artifacts\/browser-screenshot-example-com-[^.]+\.png$/,
         );
 
+        capturePage.mockClear();
         const captureCause = new Error("capture failed");
-        capturePage.mockRejectedValueOnce(captureCause);
-        const exit = yield* Effect.exit(manager.captureScreenshot("tab_1"));
+        capturePage.mockRejectedValue(captureCause);
+        const failingCapture = yield* Effect.exit(manager.captureScreenshot("tab_1")).pipe(
+          Effect.forkChild({ startImmediately: true }),
+        );
+        yield* TestClock.adjust(1_000);
+        const exit = yield* Fiber.join(failingCapture);
         expect(Exit.isFailure(exit)).toBe(true);
+        expect(capturePage).toHaveBeenCalledTimes(3);
         if (Exit.isSuccess(exit)) return;
         const error = Option.getOrThrow(Cause.findErrorOption(exit.cause));
         expect(error).toMatchObject({
@@ -762,6 +768,197 @@ describe("PreviewManager", () => {
           webContentsId: 42,
           cause: captureCause,
         });
+      }),
+    ),
+  );
+
+  effectIt.effect("retries a cold hidden-tab screenshot capture", () =>
+    withManager((manager) =>
+      Effect.gen(function* () {
+        const png = Buffer.from("preview-png");
+        const capturePage = vi
+          .fn(async () => ({
+            toPNG: () => png,
+            toJPEG: () => png,
+            getSize: () => ({ width: 100, height: 80 }),
+          }))
+          .mockRejectedValueOnce(new Error("UnknownVizError"));
+        fromId.mockReturnValue(makeTestPreviewWebContents(capturePage, 42));
+
+        yield* manager.createTab("tab_cold_screenshot");
+        yield* manager.registerWebview("tab_cold_screenshot", 42);
+        const capture = yield* manager
+          .captureScreenshot("tab_cold_screenshot")
+          .pipe(Effect.forkChild({ startImmediately: true }));
+        yield* TestClock.adjust(1_000);
+        const exit = yield* Fiber.await(capture);
+
+        expect(Exit.isSuccess(exit)).toBe(true);
+        expect(capturePage).toHaveBeenCalledTimes(2);
+      }),
+    ),
+  );
+
+  effectIt.effect("retries a cold hidden-tab automation snapshot capture", () =>
+    withManager((manager) =>
+      Effect.gen(function* () {
+        const png = Buffer.from("snapshot-png");
+        const image = {
+          toPNG: () => png,
+          toJPEG: () => png,
+          getSize: () => ({ width: 100, height: 80 }),
+        };
+        const capturePage = vi
+          .fn(async () => image)
+          .mockRejectedValueOnce(new Error("UnknownVizError"));
+        const sendCommand = vi.fn(async (method: string) => {
+          if (method === "Runtime.evaluate") {
+            return {
+              result: {
+                value: {
+                  url: "https://example.com",
+                  title: "Example",
+                  loading: false,
+                  visibleText: "Example page",
+                  interactiveElements: [],
+                },
+              },
+            };
+          }
+          if (method === "Accessibility.getFullAXTree") return { nodes: [] };
+          return undefined;
+        });
+        const testWebContents = makeTestPreviewWebContents(capturePage, 42) as unknown as Record<
+          string,
+          unknown
+        >;
+        fromId.mockReturnValue({
+          ...testWebContents,
+          isDevToolsOpened: () => false,
+          debugger: {
+            isAttached: () => false,
+            attach: vi.fn(),
+            detach: vi.fn(),
+            sendCommand,
+            on: vi.fn(),
+            off: vi.fn(),
+          },
+        } as never);
+
+        yield* manager.createTab("tab_cold_snapshot");
+        yield* manager.registerWebview("tab_cold_snapshot", 42);
+        const capture = yield* manager
+          .automationSnapshot("tab_cold_snapshot")
+          .pipe(Effect.forkChild({ startImmediately: true }));
+        yield* TestClock.adjust(1_000);
+        const exit = yield* Fiber.await(capture);
+
+        expect(Exit.isSuccess(exit)).toBe(true);
+        expect(capturePage).toHaveBeenCalledTimes(2);
+        if (Exit.isFailure(exit)) return;
+        expect(exit.value.screenshot).toEqual({
+          mimeType: "image/png",
+          data: png.toString("base64"),
+          width: 100,
+          height: 80,
+        });
+      }),
+    ),
+  );
+
+  effectIt.effect("bounds a stuck snapshot capture and releases later automation", () =>
+    withManager((manager) =>
+      Effect.gen(function* () {
+        let captureStartedResolve: (() => void) | undefined;
+        const captureStarted = new Promise<void>((resolve) => {
+          captureStartedResolve = resolve;
+        });
+        const capturePage = vi.fn(() => {
+          captureStartedResolve?.();
+          return new Promise<never>(() => undefined);
+        });
+        const sendCommand = vi.fn(
+          async (method: string, params?: { readonly expression?: string }) => {
+            if (method !== "Runtime.evaluate") return undefined;
+            return params?.expression === "42"
+              ? { result: { value: 42 } }
+              : {
+                  result: {
+                    value: {
+                      url: "https://example.com",
+                      title: "Example",
+                      loading: false,
+                      visibleText: "Example page",
+                      interactiveElements: [],
+                    },
+                  },
+                };
+          },
+        );
+        const testWebContents = makeTestPreviewWebContents(capturePage, 42) as unknown as Record<
+          string,
+          unknown
+        >;
+        fromId.mockReturnValue({
+          ...testWebContents,
+          isDevToolsOpened: () => false,
+          debugger: {
+            isAttached: () => false,
+            attach: vi.fn(),
+            detach: vi.fn(),
+            sendCommand,
+            on: vi.fn(),
+            off: vi.fn(),
+          },
+        } as never);
+
+        yield* manager.createTab("tab_stuck_snapshot");
+        yield* manager.registerWebview("tab_stuck_snapshot", 42);
+        const snapshot = yield* manager
+          .automationSnapshot("tab_stuck_snapshot")
+          .pipe(Effect.forkChild({ startImmediately: true }));
+        yield* Effect.promise(() => captureStarted);
+        const evaluation = yield* manager
+          .automationEvaluate("tab_stuck_snapshot", { expression: "42" })
+          .pipe(Effect.forkChild({ startImmediately: true }));
+
+        yield* TestClock.adjust(5_000);
+        const snapshotExit = snapshot.pollUnsafe();
+        const evaluationExit = evaluation.pollUnsafe();
+
+        expect(snapshotExit).toBeDefined();
+        expect(evaluationExit).toBeDefined();
+        if (!snapshotExit || !evaluationExit) return;
+        expect(Exit.isFailure(snapshotExit)).toBe(true);
+        expect(Exit.isSuccess(evaluationExit) && evaluationExit.value).toBe(42);
+      }),
+    ),
+  );
+
+  effectIt.effect("stops capture retries when the tab swaps to another guest", () =>
+    withManager((manager) =>
+      Effect.gen(function* () {
+        const capturePage = vi.fn(async () => ({
+          toPNG: () => Buffer.from("png"),
+          toJPEG: () => Buffer.from("jpeg"),
+          getSize: () => ({ width: 100, height: 80 }),
+        }));
+        fromId.mockReturnValue(makeTestPreviewWebContents(capturePage, 42));
+        yield* manager.createTab("tab_capture_swap");
+        yield* manager.registerWebview("tab_capture_swap", 42);
+
+        capturePage.mockClear();
+        capturePage.mockRejectedValue(new Error("UnknownVizError"));
+        const capture = yield* Effect.exit(manager.captureScreenshot("tab_capture_swap")).pipe(
+          Effect.forkChild({ startImmediately: true }),
+        );
+        fromId.mockReturnValue(makeTestPreviewWebContents(capturePage, 43));
+        yield* manager.registerWebview("tab_capture_swap", 43);
+        yield* TestClock.adjust(1_000);
+        const exit = yield* Fiber.join(capture);
+
+        expect(Exit.isFailure(exit)).toBe(true);
+        expect(capturePage).toHaveBeenCalledTimes(1);
       }),
     ),
   );

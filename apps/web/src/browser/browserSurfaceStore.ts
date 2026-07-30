@@ -30,6 +30,7 @@ export interface BrowserSurfaceContentPresentation {
 
 interface BrowserSurfaceStoreState {
   readonly byTabId: Record<string, BrowserSurfacePresentation>;
+  readonly captureCountByTabId: Record<string, number>;
   readonly claim: (tabId: string, owner: symbol, fitSourceContent: boolean) => void;
   readonly present: (
     tabId: string,
@@ -40,10 +41,16 @@ interface BrowserSurfaceStoreState {
   ) => void;
   readonly presentContent: (tabId: string, content: BrowserSurfaceContentPresentation) => void;
   readonly release: (tabId: string, owner: symbol) => void;
+  readonly beginCapture: (tabId: string) => void;
+  readonly endCapture: (tabId: string) => void;
 }
 
 export interface BrowserSurfaceLease {
   readonly present: (rect: BrowserSurfaceRect, visible: boolean, cornerRadius?: number) => boolean;
+  readonly release: () => void;
+}
+
+export interface BrowserCaptureSurfaceLease {
   readonly release: () => void;
 }
 
@@ -64,6 +71,7 @@ const rectEquals = (left: BrowserSurfaceRect | null, right: BrowserSurfaceRect):
 
 export const useBrowserSurfaceStore = create<BrowserSurfaceStoreState>()((set) => ({
   byTabId: {},
+  captureCountByTabId: {},
   claim: (tabId, owner, fitSourceContent) =>
     set((state) => {
       const current = state.byTabId[tabId];
@@ -169,7 +177,89 @@ export const useBrowserSurfaceStore = create<BrowserSurfaceStoreState>()((set) =
         },
       };
     }),
+  beginCapture: (tabId) =>
+    set((state) => ({
+      captureCountByTabId: {
+        ...state.captureCountByTabId,
+        [tabId]: (state.captureCountByTabId[tabId] ?? 0) + 1,
+      },
+    })),
+  endCapture: (tabId) =>
+    set((state) => {
+      const current = state.captureCountByTabId[tabId] ?? 0;
+      if (current <= 1) {
+        const { [tabId]: _released, ...captureCountByTabId } = state.captureCountByTabId;
+        return { captureCountByTabId };
+      }
+      return {
+        captureCountByTabId: {
+          ...state.captureCountByTabId,
+          [tabId]: current - 1,
+        },
+      };
+    }),
 }));
+
+const waitForPresentationTick = (): Promise<void> =>
+  new Promise((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(timeoutId);
+      resolve();
+    };
+    const timeoutId = window.setTimeout(finish, 50);
+    window.requestAnimationFrame(finish);
+  });
+
+const waitForCaptureParking = async (tabId: string): Promise<void> => {
+  const deadline = Date.now() + 500;
+  while (Date.now() <= deadline) {
+    const parked = Array.from(
+      document.querySelectorAll<HTMLElement>("[data-preview-viewport]"),
+    ).find(
+      (candidate) =>
+        candidate.getAttribute("data-preview-viewport") === tabId &&
+        candidate.getAttribute("data-preview-composited") === "true",
+    );
+    if (parked) {
+      await waitForPresentationTick();
+      return;
+    }
+    await waitForPresentationTick();
+  }
+};
+
+export function acquireBrowserCaptureSurface(tabId: string): BrowserCaptureSurfaceLease {
+  let released = false;
+  useBrowserSurfaceStore.getState().beginCapture(tabId);
+  return {
+    release: () => {
+      if (released) return;
+      released = true;
+      useBrowserSurfaceStore.getState().endCapture(tabId);
+    },
+  };
+}
+
+/**
+ * Keep a hidden guest inside the compositor bounds only while a one-shot
+ * capture needs it. Idle background tabs remain offscreen to avoid continuous
+ * GPU work from animated pages.
+ */
+export async function withBrowserCaptureSurface<A>(
+  tabId: string,
+  capture: () => Promise<A>,
+): Promise<A> {
+  const lease = acquireBrowserCaptureSurface(tabId);
+  try {
+    await waitForCaptureParking(tabId);
+    return await capture();
+  } finally {
+    lease.release();
+  }
+}
 
 export function acquireBrowserSurface(
   tabId: string,

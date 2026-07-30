@@ -61,6 +61,7 @@ export function HostedBrowserWebview(props: {
     useShallow((state) => {
       const current = state.byTabId[runtimeTabId];
       return {
+        captureActive: (state.captureCountByTabId[runtimeTabId] ?? 0) > 0,
         content: current?.content ?? null,
         cornerRadius: current?.cornerRadius ?? 0,
         fitSourceContent: current?.fitSourceContent ?? false,
@@ -233,6 +234,7 @@ export function HostedBrowserWebview(props: {
 
   const wrapperStyle = resolveHostedBrowserWebviewWrapperStyle({
     active,
+    captureActive: presentation.captureActive,
     cornerRadius: presentation.cornerRadius,
     rect: lastRect,
     hiddenSize,
@@ -245,6 +247,8 @@ export function HostedBrowserWebview(props: {
       style={{ ...wrapperStyle, overscrollBehavior: "contain" }}
       onScroll={syncContentPresentation}
       data-preview-viewport={runtimeTabId}
+      data-preview-composited={active || presentation.captureActive ? "true" : undefined}
+      data-preview-capture-parking={!active && presentation.captureActive ? "true" : undefined}
     >
       <div className="relative" style={{ width: layout.canvasWidth, height: layout.canvasHeight }}>
         {deviceToolbarVisible && effectiveViewport._tag !== "fill" ? (

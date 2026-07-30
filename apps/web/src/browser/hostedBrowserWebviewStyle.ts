@@ -23,8 +23,9 @@ export function resolveHostedBrowserWebviewWrapperStyle(input: {
   readonly cornerRadius?: number;
   readonly rect: BrowserSurfaceRect | null;
   readonly hiddenSize: HostedBrowserWebviewSize;
+  readonly captureActive?: boolean;
 }): HostedBrowserWebviewWrapperStyle {
-  const { active, cornerRadius = 0, hiddenSize, rect } = input;
+  const { active, captureActive = false, cornerRadius = 0, hiddenSize, rect } = input;
   if (active && rect) {
     return {
       left: rect.x,
@@ -38,8 +39,8 @@ export function resolveHostedBrowserWebviewWrapperStyle(input: {
   }
 
   return {
-    left: HIDDEN_BROWSER_WEBVIEW_OFFSET,
-    top: HIDDEN_BROWSER_WEBVIEW_OFFSET,
+    left: captureActive ? 0 : HIDDEN_BROWSER_WEBVIEW_OFFSET,
+    top: captureActive ? 0 : HIDDEN_BROWSER_WEBVIEW_OFFSET,
     width: hiddenSize.width,
     height: hiddenSize.height,
     zIndex: -1,

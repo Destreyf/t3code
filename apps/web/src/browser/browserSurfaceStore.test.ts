@@ -1,14 +1,90 @@
 import { beforeEach, describe, expect, it } from "vite-plus/test";
 
 import {
+  acquireBrowserCaptureSurface,
   acquireBrowserSurface,
   resolveBrowserSurfacePanelRect,
   useBrowserSurfaceStore,
 } from "./browserSurfaceStore";
+import {
+  HIDDEN_BROWSER_WEBVIEW_OFFSET,
+  resolveHostedBrowserWebviewWrapperStyle,
+} from "./hostedBrowserWebviewStyle";
 
 describe("browserSurfaceStore", () => {
   beforeEach(() => {
-    useBrowserSurfaceStore.setState({ byTabId: {} });
+    useBrowserSurfaceStore.setState({ byTabId: {}, captureCountByTabId: {} });
+  });
+
+  it("keeps capture parking active until every concurrent lease releases", () => {
+    const first = acquireBrowserCaptureSurface("capture-tab");
+    const second = acquireBrowserCaptureSurface("capture-tab");
+
+    expect(useBrowserSurfaceStore.getState().captureCountByTabId["capture-tab"]).toBe(2);
+    first.release();
+    first.release();
+    expect(useBrowserSurfaceStore.getState().captureCountByTabId["capture-tab"]).toBe(1);
+    second.release();
+    expect(useBrowserSurfaceStore.getState().captureCountByTabId["capture-tab"]).toBeUndefined();
+  });
+
+  it("parks only the agent-pinned background tab while another browser tab stays visible", () => {
+    const visibleTab = acquireBrowserSurface("visible-tab");
+    const pinnedTab = acquireBrowserSurface("agent-pinned-tab");
+    const visibleRect = { x: 120, y: 80, width: 900, height: 640 };
+    const pinnedRect = { x: 40, y: 60, width: 800, height: 500 };
+    visibleTab.present(visibleRect, true);
+    pinnedTab.present(pinnedRect, false);
+
+    const capture = acquireBrowserCaptureSurface("agent-pinned-tab");
+    const capturing = useBrowserSurfaceStore.getState();
+
+    expect(capturing.byTabId["visible-tab"]).toMatchObject({
+      rect: visibleRect,
+      visible: true,
+    });
+    expect(capturing.byTabId["agent-pinned-tab"]).toMatchObject({
+      rect: pinnedRect,
+      visible: false,
+    });
+    expect(capturing.captureCountByTabId).toEqual({ "agent-pinned-tab": 1 });
+    expect(
+      resolveHostedBrowserWebviewWrapperStyle({
+        active: true,
+        captureActive: false,
+        rect: visibleRect,
+        hiddenSize: { width: 900, height: 640 },
+      }),
+    ).toMatchObject({ left: 120, top: 80, zIndex: 30, pointerEvents: "auto" });
+    expect(
+      resolveHostedBrowserWebviewWrapperStyle({
+        active: false,
+        captureActive: true,
+        rect: pinnedRect,
+        hiddenSize: { width: 800, height: 500 },
+      }),
+    ).toMatchObject({ left: 0, top: 0, zIndex: -1, pointerEvents: "none" });
+
+    capture.release();
+
+    const released = useBrowserSurfaceStore.getState();
+    expect(released.captureCountByTabId).toEqual({});
+    expect(released.byTabId["visible-tab"]?.visible).toBe(true);
+    expect(
+      resolveHostedBrowserWebviewWrapperStyle({
+        active: false,
+        captureActive: false,
+        rect: pinnedRect,
+        hiddenSize: { width: 800, height: 500 },
+      }),
+    ).toMatchObject({
+      left: HIDDEN_BROWSER_WEBVIEW_OFFSET,
+      top: HIDDEN_BROWSER_WEBVIEW_OFFSET,
+      zIndex: -1,
+    });
+
+    pinnedTab.release();
+    visibleTab.release();
   });
 
   it("freezes the source content dimensions for a fitted presentation", () => {

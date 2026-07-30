@@ -57,4 +57,23 @@ describe("resolveHostedBrowserWebviewWrapperStyle", () => {
       visibility: "visible",
     });
   });
+
+  it("parks a capture target inside the window without presenting it", () => {
+    expect(
+      resolveHostedBrowserWebviewWrapperStyle({
+        active: false,
+        captureActive: true,
+        rect: null,
+        hiddenSize: { width: 800, height: 500 },
+      }),
+    ).toEqual({
+      left: 0,
+      top: 0,
+      width: 800,
+      height: 500,
+      zIndex: -1,
+      pointerEvents: "none",
+      visibility: "visible",
+    });
+  });
 });

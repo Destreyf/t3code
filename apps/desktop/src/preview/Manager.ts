@@ -34,6 +34,7 @@ import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
@@ -44,6 +45,7 @@ import * as Path from "effect/Path";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
+import * as Schedule from "effect/Schedule";
 import * as Scope from "effect/Scope";
 import * as SynchronizedRef from "effect/SynchronizedRef";
 
@@ -98,6 +100,14 @@ const MAX_EVALUATION_BYTES = 64_000;
 const MAX_VISIBLE_TEXT_LENGTH = 20_000;
 const MAX_INTERACTIVE_ELEMENTS = 200;
 const MAX_SCREENSHOT_WIDTH = 1280;
+/**
+ * Chromium may report UnknownVizError or leave capturePage pending while a
+ * hidden or freshly attached guest has no compositor frame. One-shot captures
+ * need bounded attempts so one unavailable frame cannot poison later control.
+ */
+const CAPTURE_PAGE_RETRY_ATTEMPTS = 3;
+const CAPTURE_PAGE_RETRY_DELAY_MS = 120;
+const CAPTURE_PAGE_ATTEMPT_TIMEOUT_MS = 1_000;
 const RECORDING_FRAME_INTERVAL_MS = Math.ceil(1_000 / 12);
 const RECORDING_JPEG_QUALITY = 80;
 const PICTURE_IN_PICTURE_INITIAL_WIDTH = 480;
@@ -510,6 +520,36 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
       try: evaluate,
       catch: (cause) => new PreviewOperationError({ ...errorContext, cause }),
     });
+  /**
+   * capturePage for one-shot captures (snapshots, screenshots), bounding a
+   * stalled compositor request and retrying transient warm-up failures.
+   *
+   * Retries stop as soon as the tab no longer points at this guest, so a
+   * webview swap during the retry window surfaces the original failure instead
+   * of capturing from a detached web contents.
+   */
+  const capturePageWithRetry = (
+    errorContext: PreviewOperationContext,
+    tabId: string,
+    wc: Electron.WebContents,
+  ) => {
+    const guestIsCurrent = Effect.gen(function* () {
+      if (wc.isDestroyed()) return false;
+      const tabs = yield* SynchronizedRef.get(tabsRef);
+      return tabs.get(tabId)?.webContentsId === wc.id;
+    });
+    return attemptPromise(errorContext, () => wc.capturePage()).pipe(
+      Effect.timeout(Duration.millis(CAPTURE_PAGE_ATTEMPT_TIMEOUT_MS)),
+      Effect.catchTag("TimeoutError", (cause) =>
+        Effect.fail(new PreviewOperationError({ ...errorContext, cause })),
+      ),
+      Effect.retry({
+        times: CAPTURE_PAGE_RETRY_ATTEMPTS - 1,
+        schedule: Schedule.spaced(CAPTURE_PAGE_RETRY_DELAY_MS),
+        while: () => guestIsCurrent,
+      }),
+    );
+  };
   const currentIso = DateTime.now.pipe(Effect.map(DateTime.formatIso));
   const currentMillis = Clock.currentTimeMillis;
   const encodeJson = (errorContext: PreviewOperationContext, value: unknown) =>
@@ -1996,13 +2036,14 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
     const [createdAt, millis, image] = yield* Effect.all([
       currentIso,
       currentMillis,
-      attemptPromise(
+      capturePageWithRetry(
         {
           operation: "captureScreenshot.capturePage",
           tabId,
           webContentsId: wc.id,
         },
-        () => wc.capturePage(),
+        tabId,
+        wc,
       ),
     ]);
     const id = `browser-screenshot-${artifactSiteSlug(wc.getURL())}-${millis.toString(36)}`;
@@ -2670,13 +2711,14 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
       );
       const [accessibility, sourceImage, diagnostics, timelines] = yield* Effect.all([
         send("Accessibility.getFullAXTree"),
-        attemptPromise(
+        capturePageWithRetry(
           {
             operation: "automationSnapshot.capturePage",
             tabId,
             webContentsId: wc.id,
           },
-          () => wc.capturePage(),
+          tabId,
+          wc,
         ),
         Ref.get(diagnosticsRef),
         Ref.get(actionTimelineRef),
